@@ -39,10 +39,10 @@ class MarketSession(Enum):
 
 @dataclass
 class TradingCosts:
-    commission: float = 0  
     sec_fee: float      
     finra_fee: float    
     total_cost: float
+    commission: float = 0  # Default argument at the end
 
 @dataclass
 class TradingPlan:
