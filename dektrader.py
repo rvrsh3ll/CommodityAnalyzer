@@ -1,214 +1,316 @@
+#!/usr/bin/env python3
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import List, Dict, Optional
+import time
 import logging
+from typing import Dict, List, Optional, Set
+import json
+from dataclasses import dataclass
+from enum import Enum
+import requests
+import re
+import pytz
+from discord_webhook import DiscordWebhook
+from itertools import islice
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_system.log'),
+        logging.StreamHandler()
+    ]
+)
+
+class MarketSession(Enum):
+    PRE_MARKET = "PRE_MARKET"      # 4AM-9:30AM
+    MARKET_OPEN = "MARKET_OPEN"    # 9:30AM-11AM
+    MIDDAY = "MIDDAY"             # 11AM-3PM
+    MARKET_CLOSE = "MARKET_CLOSE"  # 3PM-4PM
+    AFTER_HOURS = "AFTER_HOURS"
+    CLOSED = "CLOSED"
 
 @dataclass
-class Setup:
-    time: datetime
-    type: str  # 'Volume Spike', 'Consolidation Breakout', 'Secondary'
-    price: float
-    volume_ratio: float
-    avg_volume: float
-    risk_reward: float
-
-@dataclass
-class Trade:
-    entry_time: datetime
+class TradingPlan:
+    symbol: str
+    why: str
     entry_price: float
-    exit_time: Optional[datetime] = None
-    exit_price: Optional[float] = None
-    pnl: Optional[float] = None
-    exit_type: Optional[str] = None
-    setup_type: str = ""
+    stop_loss: float
+    profit_target: float
+    position_size: int
+    datetime: datetime
+    volume_ratio: float
+    float_category: str
+    current_volume: int
+    avg_volume: int
 
-class AutomatedDeckStrategy:
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.setups: List[Setup] = []
-        self.trades: List[Trade] = []
-        self.consolidations: List[Dict] = []
+class TradingSystem:
+    def __init__(self, initial_capital: float):
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.stocks: Set[str] = set()
+        self.last_scrape_time = datetime.min
         
-        # Configure logging
-        logging.basicConfig(
-            filename=f'{symbol}_trades.log',
-            level=logging.INFO,
-            format='%(asctime)s - %(message)s'
-        )
+        # Discord webhook URL - should be in config file in production
+        self.webhook_url = "YOUR_WEBHOOK_URL"
         
-    def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate all technical indicators"""
-        # Volume analysis
-        df['VolumeSMA20'] = df['Volume'].rolling(window=20).mean()
-        df['VolumeRatio'] = df['Volume'] / df['VolumeSMA20']
+        # Load trading history
+        self.paper_trading_history = self._load_paper_trading_history()
         
-        # Price action
-        df['TR'] = np.maximum(
-            df['High'] - df['Low'],
-            np.maximum(
-                abs(df['High'] - df['Close'].shift(1)),
-                abs(df['Low'] - df['Close'].shift(1))
+        logging.info(f"Trading System initialized with ${initial_capital:,.2f}")
+
+    def _load_paper_trading_history(self) -> Dict:
+        """Load paper trading history from file"""
+        try:
+            with open('paper_trading_history.json', 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {
+                'monthly_results': {},
+                'consecutive_green_months': 0,
+                'total_trades': 0,
+                'winning_trades': 0
+            }
+
+    def send_discord_alert(self, plan: TradingPlan, session: MarketSession):
+        """Send formatted alert to Discord with retry logic"""
+        try:
+            webhook = DiscordWebhook(
+                url=self.webhook_url,
+                rate_limit_retry=True,
+                timeout=5
             )
-        )
-        df['ATR20'] = df['TR'].rolling(window=20).mean()
-        df['PriceRange'] = df['High'] - df['Low']
-        df['RangeRatio'] = df['PriceRange'] / df['ATR20']
-        
-        # Consolidation detection
-        df['Consolidating'] = df['RangeRatio'] < 0.5
-        
-        return df
-        
-    def find_consolidations(self, df: pd.DataFrame, min_bars: int = 5):
-        """Identify consolidation periods"""
-        consolidation_start = None
-        consol_bars = 0
-        
-        for i in range(len(df)):
-            if df['Consolidating'].iloc[i]:
-                if consolidation_start is None:
-                    consolidation_start = df.index[i]
-                consol_bars += 1
-            else:
-                if consol_bars >= min_bars:
-                    consol_data = {
-                        'start': consolidation_start,
-                        'end': df.index[i-1],
-                        'duration': consol_bars,
-                        'avg_price': df['Close'].iloc[i-consol_bars:i].mean(),
-                        'volume_avg': df['Volume'].iloc[i-consol_bars:i].mean()
-                    }
-                    self.consolidations.append(consol_data)
-                consolidation_start = None
-                consol_bars = 0
+            
+            # Create formatted message
+            message = (
+                f"🎯 TRADING SETUP: {plan.symbol}\n\n"
+                f"💰 Entry: ${plan.entry_price:.2f}\n"
+                f"🎯 Target: ${plan.profit_target:.2f}\n"
+                f"⛔ Stop: ${plan.stop_loss:.2f}\n"
+                f"📊 Size: {plan.position_size:,} shares\n\n"
+                f"📈 Volume: {plan.volume_ratio:.1f}x average\n"
+                f"Float: {plan.float_category}\n"
+                f"Session: {session.value}\n"
+                f"Reason: {plan.why}"
+            )
+            
+            webhook.content = message
+            response = webhook.execute()
+            
+            if response.status_code not in [200, 204]:
+                logging.error(f"Discord alert failed with status {response.status_code}")
                 
-    def identify_setups(self, df: pd.DataFrame):
-        """Find all potential trade setups"""
-        # 1. Volume spike setups
-        volume_spikes = df[df['VolumeRatio'] >= 5]
-        for time, row in volume_spikes.iterrows():
-            self.setups.append(Setup(
-                time=time,
-                type='Volume Spike',
-                price=row['Close'],
-                volume_ratio=row['VolumeRatio'],
-                avg_volume=row['VolumeSMA20'],
-                risk_reward=2.0  # 10% gain vs 5% loss
-            ))
+        except Exception as e:
+            logging.error(f"Discord alert failed for {plan.symbol}: {str(e)}")
+
+    def _get_scraping_interval(self, session: MarketSession) -> int:
+        """Get appropriate scraping interval based on market session"""
+        intervals = {
+            MarketSession.PRE_MARKET: 120,    # 2 min
+            MarketSession.MARKET_OPEN: 60,    # 1 min
+            MarketSession.MARKET_CLOSE: 60,   # 1 min
+            MarketSession.MIDDAY: 300,        # 5 min
+            MarketSession.AFTER_HOURS: 600,   # 10 min
+            MarketSession.CLOSED: 600         # 10 min
+        }
+        return intervals.get(session, 300)
+
+    def _scrape_stock_symbols(self) -> set:
+        """Scrape stock symbols with retry logic"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
         
-        # 2. Consolidation breakout setups
-        for consol in self.consolidations:
-            # Look for volume spike after consolidation
-            post_consol = df[consol['end']:].iloc[1:5]  # Check next 5 bars
-            if not post_consol.empty:
-                breakout = post_consol[post_consol['VolumeRatio'] >= 3]  # Lower threshold for breakouts
-                if not breakout.empty:
-                    self.setups.append(Setup(
-                        time=breakout.index[0],
-                        type='Consolidation Breakout',
-                        price=breakout['Close'].iloc[0],
-                        volume_ratio=breakout['VolumeRatio'].iloc[0],
-                        avg_volume=breakout['VolumeSMA20'].iloc[0],
-                        risk_reward=2.0
-                    ))
+        retries = 3
+        while retries > 0:
+            try:
+                response = requests.get('https://biztoc.com/', 
+                                     headers=headers,
+                                     timeout=10)
+                
+                if response.status_code == 200:
+                    symbols = set(re.findall(r'<div class="stock_symbol">(.*?)</div>', 
+                                           response.text))
+                    logging.info(f"Scraped {len(symbols)} symbols")
+                    return symbols
                     
-    def simulate_trades(self, df: pd.DataFrame):
-        """Simulate trades based on setups"""
-        for setup in self.setups:
-            # Get data after setup
-            future_data = df[setup.time:]
-            if len(future_data) < 2:  # Need at least 2 bars for entry/exit
-                continue
+            except Exception as e:
+                logging.error(f"Scraping attempt {4-retries} failed: {str(e)}")
                 
-            # Calculate entry on next bar
-            entry_bar = future_data.iloc[1]
-            entry_price = entry_bar['Open']
-            stop_loss = entry_price * 0.95  # 5% stop
-            target = entry_price * 1.10     # 10% target
+            retries -= 1
+            time.sleep(2)
             
-            trade = Trade(
-                entry_time=entry_bar.name,
-                entry_price=entry_price,
-                setup_type=setup.type
-            )
-            
-            # Simulate trade
-            for i in range(2, len(future_data)):
-                bar = future_data.iloc[i]
-                
-                if bar['Low'] <= stop_loss:
-                    trade.exit_time = bar.name
-                    trade.exit_price = stop_loss
-                    trade.pnl = -5.0  # 5% loss
-                    trade.exit_type = 'Stop Loss'
-                    break
-                elif bar['High'] >= target:
-                    trade.exit_time = bar.name
-                    trade.exit_price = target
-                    trade.pnl = 10.0  # 10% gain
-                    trade.exit_type = 'Target'
-                    break
-            
-            if trade.exit_time:  # Only add completed trades
-                self.trades.append(trade)
-                logging.info(f"Trade completed - {setup.type}: Entry ${entry_price:.4f}, Exit ${trade.exit_price:.4f}, P/L: {trade.pnl}%")
-                
-    def analyze_stock(self, date_str: str):
-        """Run complete analysis for a given date"""
-        print(f"\nAnalyzing {self.symbol} for {date_str}")
-        
-        # Get data
-        start_date = datetime.strptime(date_str, '%Y-%m-%d')
-        end_date = start_date + timedelta(days=1)
-        
-        df = yf.Ticker(self.symbol).history(
-            start=start_date,
-            end=end_date,
-            interval='1m',
-            prepost=True
-        )
-        
-        if df.empty:
-            print("No data available")
-            return
-            
-        # Run analysis
-        df = self.preprocess_data(df)
-        self.find_consolidations(df)
-        self.identify_setups(df)
-        self.simulate_trades(df)
-        
-        # Print results
-        print("\nTrade Summary:")
-        if self.trades:
-            winning_trades = len([t for t in self.trades if t.pnl > 0])
-            print(f"Total Trades: {len(self.trades)}")
-            print(f"Winning Trades: {winning_trades}")
-            print(f"Win Rate: {(winning_trades/len(self.trades)*100):.1f}%")
-            
-            total_pnl = sum(t.pnl for t in self.trades if t.pnl)
-            print(f"Total P/L: {total_pnl:.1f}%")
-            
-            print("\nDetailed Trade Report:")
-            for i, trade in enumerate(self.trades, 1):
-                print(f"\nTrade #{i} ({trade.setup_type}):")
-                print(f"Entry: {trade.entry_time.strftime('%I:%M:%S %p')} @ ${trade.entry_price:.4f}")
-                print(f"Exit: {trade.exit_time.strftime('%I:%M:%S %p')} @ ${trade.exit_price:.4f}")
-                print(f"Result: {trade.exit_type} ({trade.pnl:+.1f}%)")
+        return set()
+
+    def _categorize_float(self, shares_float: float) -> str:
+        """Categorize float size"""
+        if shares_float < 5_000_000:
+            return "🔥 VERY LOW FLOAT (<5M)"
+        elif shares_float < 15_000_000:
+            return "⭐ LOW FLOAT (5M-15M)"
+        elif shares_float < 30_000_000:
+            return "📊 AVERAGE FLOAT (15M-30M)"
         else:
-            print("No trades executed")
+            return "🔷 HIGH FLOAT (>30M)"
+
+    def get_market_session(self) -> MarketSession:
+        """Determine current market session"""
+        et_tz = pytz.timezone('US/Eastern')
+        now = datetime.now(et_tz)
+        
+        # Return closed for weekends
+        if now.weekday() >= 5:
+            return MarketSession.CLOSED
             
-        print("\nConsolidation Periods:")
-        for i, consol in enumerate(self.consolidations, 1):
-            print(f"\nPeriod #{i}:")
-            print(f"Start: {consol['start'].strftime('%I:%M:%S %p')}")
-            print(f"End: {consol['end'].strftime('%I:%M:%S %p')}")
-            print(f"Duration: {consol['duration']} minutes")
-            print(f"Average Price: ${consol['avg_price']:.4f}")
+        # Define session times
+        pre_market_start = now.replace(hour=4, minute=0, second=0)
+        market_open = now.replace(hour=9, minute=30, second=0)
+        midday_start = now.replace(hour=11, minute=0, second=0)
+        market_close_start = now.replace(hour=15, minute=0, second=0)
+        market_end = now.replace(hour=16, minute=0, second=0)
+        after_hours_end = now.replace(hour=20, minute=0, second=0)
+        
+        if pre_market_start <= now < market_open:
+            return MarketSession.PRE_MARKET
+        elif market_open <= now < midday_start:
+            return MarketSession.MARKET_OPEN
+        elif midday_start <= now < market_close_start:
+            return MarketSession.MIDDAY
+        elif market_close_start <= now < market_end:
+            return MarketSession.MARKET_CLOSE
+        elif market_end <= now < after_hours_end:
+            return MarketSession.AFTER_HOURS
+        else:
+            return MarketSession.CLOSED
+
+    def _chunk_symbols(self, symbols: Set[str], size: int = 10):
+        """Split symbols into chunks for processing"""
+        it = iter(symbols)
+        return iter(lambda: tuple(islice(it, size)), ())
+
+    def _get_historical_data(self, symbol: str, period: str = '5d') -> Optional[pd.DataFrame]:
+        """Get historical data with validation"""
+        try:
+            data = yf.Ticker(symbol).history(period=period)
+            return data if not data.empty else None
+        except Exception as e:
+            logging.error(f"Error fetching data for {symbol}: {str(e)}")
+            return None
+
+    def _calculate_position_size(self, price: float, stop_loss: float) -> int:
+        """Calculate position size based on risk management"""
+        risk_per_trade = self.current_capital * 0.01  # 1% risk
+        risk_per_share = price - stop_loss
+        return int(risk_per_trade / risk_per_share) if risk_per_share > 0 else 0
+
+    def analyze_stock(self, symbol: str, session: MarketSession) -> Optional[TradingPlan]:
+        """Analyze stock for potential trade setup"""
+        try:
+            # Get current data
+            hist = self._get_historical_data(symbol, period='1d')
+            if hist is None or hist.empty:
+                return None
+                
+            current_price = hist['Close'].iloc[-1]
+            current_volume = hist['Volume'].sum()
+            
+            # Get float information
+            stock = yf.Ticker(symbol)
+            try:
+                shares_float = stock.info['floatShares']
+                float_category = self._categorize_float(shares_float)
+            except:
+                float_category = "UNKNOWN FLOAT"
+                
+            # Volume analysis
+            daily_hist = self._get_historical_data(symbol, period='5d')
+            if daily_hist is None:
+                return None
+                
+            avg_volume = daily_hist['Volume'].mean()
+            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+            
+            # Only proceed if significant volume
+            if volume_ratio > 5:
+                profit_target = current_price * 1.10  # 10% target
+                stop_loss = current_price * 0.95     # 5% stop
+                
+                position_size = self._calculate_position_size(current_price, stop_loss)
+                
+                return TradingPlan(
+                    symbol=symbol,
+                    why=f"Volume surge ({volume_ratio:.1f}x avg), {float_category}",
+                    entry_price=current_price,
+                    stop_loss=stop_loss,
+                    profit_target=profit_target,
+                    position_size=position_size,
+                    datetime=datetime.now(pytz.timezone('US/Eastern')),
+                    volume_ratio=volume_ratio,
+                    float_category=float_category,
+                    current_volume=int(current_volume),
+                    avg_volume=int(avg_volume)
+                )
+                
+        except Exception as e:
+            logging.error(f"Error analyzing {symbol}: {str(e)}")
+            return None
+
+    def update_watchlist(self, session: MarketSession):
+        """Update watchlist with validation"""
+        try:
+            now = datetime.now()
+            interval = self._get_scraping_interval(session)
+            
+            if (now - self.last_scrape_time).total_seconds() >= interval:
+                new_symbols = self._scrape_stock_symbols()
+                
+                if new_symbols:
+                    self.stocks = new_symbols  # Replace instead of update
+                    self.last_scrape_time = now
+                    logging.info(f"Updated watchlist: {len(self.stocks)} symbols")
+                    
+        except Exception as e:
+            logging.error(f"Error updating watchlist: {str(e)}")
+
+    def run(self):
+        """Main system loop"""
+        logging.info("Starting Trading System...")
+        
+        while True:
+            try:
+                session = self.get_market_session()
+                
+                if session == MarketSession.CLOSED:
+                    logging.info("Market closed, waiting...")
+                    time.sleep(300)
+                    continue
+                
+                # Update watchlist
+                self.update_watchlist(session)
+                
+                # Process stocks in chunks
+                for chunk in self._chunk_symbols(self.stocks):
+                    for symbol in chunk:
+                        plan = self.analyze_stock(symbol, session)
+                        if plan:
+                            self.send_discord_alert(plan, session)
+                    time.sleep(2)  # Rate limiting
+                    
+                # Sleep based on session
+                time.sleep(self._get_scraping_interval(session))
+                
+            except KeyboardInterrupt:
+                logging.info("Shutting down trading system...")
+                break
+            except Exception as e:
+                logging.error(f"System error: {str(e)}")
+                time.sleep(60)
 
 if __name__ == "__main__":
-    strategy = AutomatedDeckStrategy("PRFX")
-    strategy.analyze_stock("2024-12-19")
+    # Initialize system with $10,000 starting capital
+    system = TradingSystem(10000)
+    system.run()
