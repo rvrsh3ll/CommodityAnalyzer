@@ -26,6 +26,9 @@ logging.basicConfig(
     ]
 )
 
+# Discord webhook URL
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1286420702173597807/hNgcuYY68fm6t0ncWSSGt2QwrQvEybW5uRrr2nXZCMiizQnq6Wguhm41SBJcO8TicQWy"
+
 class MarketSession(Enum):
     PRE_MARKET = "PRE_MARKET"      # 4AM-9:30AM
     MARKET_OPEN = "MARKET_OPEN"    # 9:30AM-11AM
@@ -33,6 +36,13 @@ class MarketSession(Enum):
     MARKET_CLOSE = "MARKET_CLOSE"  # 3PM-4PM
     AFTER_HOURS = "AFTER_HOURS"
     CLOSED = "CLOSED"
+
+@dataclass
+class TradingCosts:
+    commission: float = 0  
+    sec_fee: float      
+    finra_fee: float    
+    total_cost: float
 
 @dataclass
 class TradingPlan:
@@ -47,6 +57,7 @@ class TradingPlan:
     float_category: str
     current_volume: int
     avg_volume: int
+    costs: TradingCosts
 
 class TradingSystem:
     def __init__(self, initial_capital: float):
@@ -54,30 +65,16 @@ class TradingSystem:
         self.current_capital = initial_capital
         self.stocks: Set[str] = set()
         self.last_scrape_time = datetime.min
-        
-        # Discord webhook URL - should be in config file in production
-        self.webhook_url = "YOUR_WEBHOOK_URL"
-        
-        # Load trading history
-        self.paper_trading_history = self._load_paper_trading_history()
+        self.webhook_url = DISCORD_WEBHOOK_URL
+        self.blacklist = {'MLECW'}  # Add known problematic symbols
+        self.min_price = 1.00  # Minimum price filter
+        self.max_price = 50.00  # Maximum price filter
+        self.min_volume = 50000  # Minimum volume filter
         
         logging.info(f"Trading System initialized with ${initial_capital:,.2f}")
 
-    def _load_paper_trading_history(self) -> Dict:
-        """Load paper trading history from file"""
-        try:
-            with open('paper_trading_history.json', 'r') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {
-                'monthly_results': {},
-                'consecutive_green_months': 0,
-                'total_trades': 0,
-                'winning_trades': 0
-            }
-
     def send_discord_alert(self, plan: TradingPlan, session: MarketSession):
-        """Send formatted alert to Discord with retry logic"""
+        """Send formatted alert to Discord"""
         try:
             webhook = DiscordWebhook(
                 url=self.webhook_url,
@@ -85,13 +82,22 @@ class TradingSystem:
                 timeout=5
             )
             
-            # Create formatted message
+            # Calculate potential profit/loss after fees
+            max_profit = (plan.profit_target - plan.entry_price) * plan.position_size - plan.costs.total_cost
+            max_loss = (plan.entry_price - plan.stop_loss) * plan.position_size + plan.costs.total_cost
+            
             message = (
                 f"🎯 TRADING SETUP: {plan.symbol}\n\n"
                 f"💰 Entry: ${plan.entry_price:.2f}\n"
                 f"🎯 Target: ${plan.profit_target:.2f}\n"
                 f"⛔ Stop: ${plan.stop_loss:.2f}\n"
                 f"📊 Size: {plan.position_size:,} shares\n\n"
+                f"💵 Cost Analysis:\n"
+                f"SEC Fee: ${plan.costs.sec_fee:.2f}\n"
+                f"FINRA Fee: ${plan.costs.finra_fee:.2f}\n"
+                f"Total Fees: ${plan.costs.total_cost:.2f}\n"
+                f"Max Profit (after fees): ${max_profit:.2f}\n"
+                f"Max Loss (after fees): ${max_loss:.2f}\n\n"
                 f"📈 Volume: {plan.volume_ratio:.1f}x average\n"
                 f"Float: {plan.float_category}\n"
                 f"Session: {session.value}\n"
@@ -101,7 +107,7 @@ class TradingSystem:
             webhook.content = message
             response = webhook.execute()
             
-            if response.status_code not in [200, 204]:
+            if response and response.status_code not in [200, 204]:
                 logging.error(f"Discord alert failed with status {response.status_code}")
                 
         except Exception as e:
@@ -120,34 +126,33 @@ class TradingSystem:
         return intervals.get(session, 300)
 
     def _scrape_stock_symbols(self) -> set:
-        """Scrape stock symbols with retry logic"""
+        """Scrape stock symbols with filtering"""
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        retries = 3
-        while retries > 0:
-            try:
-                response = requests.get('https://biztoc.com/', 
-                                     headers=headers,
-                                     timeout=10)
+        try:
+            response = requests.get('https://biztoc.com/',
+                                 headers=headers,
+                                 timeout=10)
+            
+            if response.status_code == 200:
+                # Extract symbols and filter out blacklisted ones
+                symbols = set(re.findall(r'<div class="stock_symbol">(.*?)</div>', 
+                                       response.text))
+                filtered_symbols = {sym for sym in symbols if sym not in self.blacklist}
                 
-                if response.status_code == 200:
-                    symbols = set(re.findall(r'<div class="stock_symbol">(.*?)</div>', 
-                                           response.text))
-                    logging.info(f"Scraped {len(symbols)} symbols")
-                    return symbols
-                    
-            except Exception as e:
-                logging.error(f"Scraping attempt {4-retries} failed: {str(e)}")
+                if len(filtered_symbols) > 0:
+                    logging.info(f"Scraped {len(filtered_symbols)} valid symbols")
+                    return filtered_symbols
                 
-            retries -= 1
-            time.sleep(2)
+        except Exception as e:
+            logging.error(f"Scraping failed: {str(e)}")
             
         return set()
 
     def _categorize_float(self, shares_float: float) -> str:
-        """Categorize float size"""
+        """Categorize float size per video guidelines"""
         if shares_float < 5_000_000:
             return "🔥 VERY LOW FLOAT (<5M)"
         elif shares_float < 15_000_000:
@@ -156,6 +161,47 @@ class TradingSystem:
             return "📊 AVERAGE FLOAT (15M-30M)"
         else:
             return "🔷 HIGH FLOAT (>30M)"
+
+    def _is_valid_stock(self, symbol: str) -> bool:
+        """Validate stock against filters"""
+        try:
+            stock = yf.Ticker(symbol)
+            hist = stock.history(period='1d')
+            
+            if hist.empty:
+                return False
+                
+            price = hist['Close'].iloc[-1]
+            volume = hist['Volume'].sum()
+            
+            # Apply filters
+            return (
+                self.min_price <= price <= self.max_price and
+                volume >= self.min_volume and
+                symbol not in self.blacklist
+            )
+            
+        except Exception:
+            return False
+
+    def _calculate_trading_costs(self, price: float, shares: int) -> TradingCosts:
+        """Calculate Robinhood trading costs"""
+        principal = price * shares
+        sec_fee = (principal / 1_000_000) * 8.00
+        finra_fee = (principal / 1_000) * 0.02
+        total_cost = sec_fee + finra_fee
+        
+        return TradingCosts(
+            sec_fee=sec_fee,
+            finra_fee=finra_fee,
+            total_cost=total_cost
+        )
+
+    def _calculate_position_size(self, price: float, stop_loss: float) -> int:
+        """Calculate position size based on risk management"""
+        risk_per_trade = self.current_capital * 0.01  # 1% risk
+        risk_per_share = price - stop_loss
+        return int(risk_per_trade / risk_per_share) if risk_per_share > 0 else 0
 
     def get_market_session(self) -> MarketSession:
         """Determine current market session"""
@@ -187,59 +233,46 @@ class TradingSystem:
         else:
             return MarketSession.CLOSED
 
-    def _chunk_symbols(self, symbols: Set[str], size: int = 10):
-        """Split symbols into chunks for processing"""
-        it = iter(symbols)
-        return iter(lambda: tuple(islice(it, size)), ())
-
-    def _get_historical_data(self, symbol: str, period: str = '5d') -> Optional[pd.DataFrame]:
-        """Get historical data with validation"""
-        try:
-            data = yf.Ticker(symbol).history(period=period)
-            return data if not data.empty else None
-        except Exception as e:
-            logging.error(f"Error fetching data for {symbol}: {str(e)}")
-            return None
-
-    def _calculate_position_size(self, price: float, stop_loss: float) -> int:
-        """Calculate position size based on risk management"""
-        risk_per_trade = self.current_capital * 0.01  # 1% risk
-        risk_per_share = price - stop_loss
-        return int(risk_per_trade / risk_per_share) if risk_per_share > 0 else 0
-
     def analyze_stock(self, symbol: str, session: MarketSession) -> Optional[TradingPlan]:
-        """Analyze stock for potential trade setup"""
+        """Analyze stock with enhanced filtering"""
         try:
-            # Get current data
-            hist = self._get_historical_data(symbol, period='1d')
-            if hist is None or hist.empty:
+            if not self._is_valid_stock(symbol):
+                return None
+                
+            stock = yf.Ticker(symbol)
+            hist = stock.history(period='1d', interval='1m')
+            
+            if hist.empty:
                 return None
                 
             current_price = hist['Close'].iloc[-1]
             current_volume = hist['Volume'].sum()
             
-            # Get float information
-            stock = yf.Ticker(symbol)
+            # Get float if available
             try:
-                shares_float = stock.info['floatShares']
+                shares_float = stock.info.get('floatShares', 0)
                 float_category = self._categorize_float(shares_float)
             except:
                 float_category = "UNKNOWN FLOAT"
                 
             # Volume analysis
-            daily_hist = self._get_historical_data(symbol, period='5d')
-            if daily_hist is None:
+            daily_hist = stock.history(period='5d')
+            if daily_hist.empty:
                 return None
                 
             avg_volume = daily_hist['Volume'].mean()
             volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
             
-            # Only proceed if significant volume
-            if volume_ratio > 5:
-                profit_target = current_price * 1.10  # 10% target
-                stop_loss = current_price * 0.95     # 5% stop
+            # Enhanced setup criteria
+            if (volume_ratio > 5 and 
+                current_price >= self.min_price and 
+                current_volume >= self.min_volume):
+                
+                profit_target = current_price * 1.10
+                stop_loss = current_price * 0.95
                 
                 position_size = self._calculate_position_size(current_price, stop_loss)
+                costs = self._calculate_trading_costs(current_price, position_size)
                 
                 return TradingPlan(
                     symbol=symbol,
@@ -252,12 +285,18 @@ class TradingSystem:
                     volume_ratio=volume_ratio,
                     float_category=float_category,
                     current_volume=int(current_volume),
-                    avg_volume=int(avg_volume)
+                    avg_volume=int(avg_volume),
+                    costs=costs
                 )
                 
         except Exception as e:
             logging.error(f"Error analyzing {symbol}: {str(e)}")
             return None
+
+    def _chunk_symbols(self, symbols: Set[str], size: int = 10):
+        """Split symbols into chunks for processing"""
+        it = iter(symbols)
+        return iter(lambda: tuple(islice(it, size)), ())
 
     def update_watchlist(self, session: MarketSession):
         """Update watchlist with validation"""
