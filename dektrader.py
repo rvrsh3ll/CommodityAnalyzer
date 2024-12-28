@@ -21,7 +21,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
     handlers=[
-        logging.FileHandler('trading_system.log'),
+        logging.FileHandler('trading_scanner.log'),
         logging.StreamHandler()
     ]
 )
@@ -42,7 +42,15 @@ class TradingCosts:
     sec_fee: float      
     finra_fee: float    
     total_cost: float
-    commission: float = 0
+
+@dataclass 
+class AlertHistory:
+    last_price: float
+    last_volume: int
+    last_alert_time: datetime
+    alert_count: int
+    daily_alerts: int
+    last_alert_date: datetime
 
 @dataclass 
 class TradingPlan:
@@ -61,43 +69,106 @@ class TradingPlan:
     pattern: Optional[str] = None
 
 class TradingSystem:
-    def __init__(self, initial_capital: float):
-        self.initial_capital = initial_capital
-        self.current_capital = initial_capital
+    def __init__(self):
         self.stocks: Set[str] = set()
         self.last_scrape_time = datetime.min
         self.webhook_url = DISCORD_WEBHOOK_URL
         self.blacklist = {'MLECW'}  # Known problematic symbols
+        self.alert_history: Dict[str, AlertHistory] = {}
 
-        # Trading session parameters based on Ross's strategy
+        # Trading session parameters
         self.trade_session = {
             'start_time': '09:30',  # Market open
             'end_time': '11:30',    # End active trading after 2 hours
             'best_hours': ['09:30', '10:30']  # Most profitable hour
         }
         
-        # Price and float filters - "2020 Rule" from Ross
+        # Price and float filters
         self.trading_filters = {
-            'min_price': 2.00,      # Min $2 based on transcript
-            'max_price': 20.00,     # "2020 Rule" - $20 max price
+            'min_price': 2.00,      # Min $2
+            'max_price': 20.00,     # $20 max price
             'min_volume': 500000,   # Minimum daily volume
-            'max_float': 20000000,  # "2020 Rule" - 20M float max
+            'max_float': 20000000,  # 20M float max
             'min_rel_volume': 5.0   # 500% relative volume minimum
         }
         
-        # Risk management parameters from Ross's strategy
-        self.risk_rules = {
-            'max_loss_day': 2000,     # Stop trading if down $2k
-            'max_size_capital': 0.95,  # Max 95% of buying power
-            'initial_stop': 0.95,      # 5% stop loss from entry
-            'profit_target': 1.10,     # 10% profit target
-            'risk_per_trade': 0.01     # 1% account risk per trade
-        }
+        logging.info("Trading Scanner initialized")
+
+    def _should_alert(self, symbol: str, current_price: float, current_volume: int, timestamp: datetime) -> bool:
+        """Determine if we should send a new alert based on history"""
+        # Check if we have any history for this symbol
+        if symbol not in self.alert_history:
+            return True
+            
+        history = self.alert_history[symbol]
         
-        logging.info(f"Trading System initialized with ${initial_capital:,.2f}")
+        # Check if it's a new day
+        current_date = timestamp.date()
+        if current_date != history.last_alert_date.date():
+            history.daily_alerts = 0
+            
+        # Don't alert if we've already sent 5 alerts today
+        if history.daily_alerts >= 5:
+            logging.info(f"Skipping {symbol} - max daily alerts reached")
+            return False
+            
+        # Don't alert if less than 15 minutes have passed
+        time_since_last = (timestamp - history.last_alert_time).total_seconds()
+        if time_since_last < 900:  # 15 minutes
+            logging.info(f"Skipping {symbol} - too soon since last alert ({time_since_last:.0f}s)")
+            return False
+            
+        # Calculate price movement since last alert
+        price_change_pct = abs(current_price - history.last_price) / history.last_price
+        if price_change_pct < 0.03:  # 3% minimum price movement
+            logging.info(f"Skipping {symbol} - insufficient price movement ({price_change_pct:.1%})")
+            return False
+            
+        # Check for significant new volume
+        volume_since_last = current_volume - history.last_volume
+        if volume_since_last < 100000:  # Minimum new volume
+            logging.info(f"Skipping {symbol} - insufficient new volume")
+            return False
+            
+        return True
+
+    def _record_alert(self, symbol: str, price: float, volume: int, timestamp: datetime):
+        """Record alert details for future reference"""
+        # Get existing history or create new
+        history = self.alert_history.get(symbol)
+        if history:
+            # Update existing history
+            history.last_price = price
+            history.last_volume = volume
+            history.last_alert_time = timestamp
+            history.alert_count += 1
+            
+            # Update daily alerts if same day, reset if new day
+            if timestamp.date() == history.last_alert_date.date():
+                history.daily_alerts += 1
+            else:
+                history.daily_alerts = 1
+                
+            history.last_alert_date = timestamp
+        else:
+            # Create new history
+            self.alert_history[symbol] = AlertHistory(
+                last_price=price,
+                last_volume=volume,
+                last_alert_time=timestamp,
+                alert_count=1,
+                daily_alerts=1,
+                last_alert_date=timestamp
+            )
+        
+        logging.info(f"Recorded alert for {symbol} - Price: ${price:.2f}, Volume: {volume:,}")
 
     def send_discord_alert(self, plan: TradingPlan, session: MarketSession):
-        """Send formatted alert to Discord with enhanced pattern info"""
+        """Send formatted alert to Discord with tracking"""
+        # Check if we should alert
+        if not self._should_alert(plan.symbol, plan.entry_price, plan.current_volume, plan.datetime):
+            return
+            
         try:
             webhook = DiscordWebhook(
                 url=self.webhook_url,
@@ -132,7 +203,9 @@ class TradingSystem:
             webhook.content = message
             response = webhook.execute()
             
-            if response and response.status_code not in [200, 204]:
+            if response and response.status_code in [200, 204]:
+                self._record_alert(plan.symbol, plan.entry_price, plan.current_volume, plan.datetime)
+            else:
                 logging.error(f"Discord alert failed with status {response.status_code}")
                 
         except Exception as e:
@@ -176,7 +249,7 @@ class TradingSystem:
         return set()
 
     def _categorize_float(self, shares_float: float) -> str:
-        """Categorize float size based on Ross's guidelines"""
+        """Categorize float size"""
         if shares_float < 5_000_000:
             return "🔥 VERY LOW FLOAT (<5M)"
         elif shares_float < 15_000_000:
@@ -187,7 +260,7 @@ class TradingSystem:
             return "🔷 HIGH FLOAT (>30M)"
 
     def _is_valid_stock(self, symbol: str) -> bool:
-        """Validate stock against enhanced filters"""
+        """Validate stock against filters"""
         try:
             stock = yf.Ticker(symbol)
             hist = stock.history(period='1d')
@@ -198,7 +271,6 @@ class TradingSystem:
             price = hist['Close'].iloc[-1]
             volume = hist['Volume'].sum()
             
-            # Apply enhanced filters from Ross's strategy
             return (
                 self.trading_filters['min_price'] <= price <= self.trading_filters['max_price'] and
                 volume >= self.trading_filters['min_volume'] and
@@ -222,25 +294,25 @@ class TradingSystem:
         )
 
     def _calculate_position_size(self, price: float, stop_loss: float) -> int:
-        """Calculate position size based on Ross's 1% risk rule"""
-        risk_per_trade = self.current_capital * self.risk_rules['risk_per_trade']
+        """Calculate theoretical position size for max $100 risk"""
         risk_per_share = price - stop_loss
         if risk_per_share <= 0:
             return 0
             
-        position = int(risk_per_trade / risk_per_share)
+        # Target $100 risk per trade    
+        position = int(100 / risk_per_share)
         
-        # Limit to 95% max of buying power
-        max_shares = int((self.current_capital * self.risk_rules['max_size_capital']) / price)
+        # Limit position to keep max loss around $100
+        max_shares = int(10000 / price)  # Using $10k theoretical capital
         return min(position, max_shares)
 
     def _analyze_pattern(self, hist: pd.DataFrame) -> Optional[str]:
-        """Analyze for Ross's favorite patterns"""
+        """Analyze for specific patterns"""
         try:
-            # Calculate 9 EMA for his setups
+            # Calculate 9 EMA
             hist['EMA9'] = hist['Close'].ewm(span=9, adjust=False).mean()
             
-            # Look for bull flag pattern - First pullback
+            # Look for bull flag pattern
             if (hist['High'].iloc[-5:].max() > hist['High'].iloc[-10:-5].max() and
                 hist['Low'].iloc[-3:].min() > hist['Low'].iloc[-6:-3].min()):
                 return "Bull Flag - First Pullback"
@@ -260,6 +332,8 @@ class TradingSystem:
         except Exception as e:
             logging.error(f"Error in pattern analysis: {str(e)}")
             return None
+
+# PART 2
 
     def get_market_session(self) -> MarketSession:
         """Determine current market session"""
@@ -290,7 +364,7 @@ class TradingSystem:
             return MarketSession.CLOSED
 
     def analyze_stock(self, symbol: str, session: MarketSession) -> Optional[TradingPlan]:
-        """Analyze stock with enhanced criteria from Ross's strategy"""
+        """Analyze stock with enhanced criteria"""
         try:
             if not self._is_valid_stock(symbol):
                 return None
@@ -325,8 +399,8 @@ class TradingSystem:
                 # Identify pattern
                 pattern = self._analyze_pattern(hist)
                 
-                profit_target = current_price * self.risk_rules['profit_target']
-                stop_loss = current_price * self.risk_rules['initial_stop']
+                profit_target = current_price * 1.10  # 10% target
+                stop_loss = current_price * 0.95     # 5% stop
                 
                 position_size = self._calculate_position_size(current_price, stop_loss)
                 costs = self._calculate_trading_costs(current_price, position_size)
@@ -352,7 +426,7 @@ class TradingSystem:
             return None
 
     def _chunk_symbols(self, symbols: Set[str], size: int = 10):
-        """Split symbols into chunks for processing to avoid rate limits"""
+        """Split symbols into chunks for processing"""
         it = iter(symbols)
         return iter(lambda: tuple(islice(it, size)), ())
 
@@ -366,7 +440,6 @@ class TradingSystem:
                 new_symbols = self._scrape_stock_symbols()
                 
                 if new_symbols:
-                    # Replace instead of update based on Ross's strategy of focusing on fresh setups
                     self.stocks = new_symbols
                     self.last_scrape_time = now
                     logging.info(f"Updated watchlist: {len(self.stocks)} symbols")
@@ -375,32 +448,21 @@ class TradingSystem:
             logging.error(f"Error updating watchlist: {str(e)}")
 
     def run(self):
-        """Main system loop with Ross's trading hours focus"""
-        logging.info("Starting Trading System...")
-        daily_pnl = 0  # Track daily P&L for max loss rule
+        """Main system loop with enhanced logging"""
+        logging.info("Starting Trading Scanner...")
         
         while True:
             try:
                 session = self.get_market_session()
                 
-                # Reset P&L at market open
-                if session == MarketSession.MARKET_OPEN:
-                    daily_pnl = 0
-                
                 if session == MarketSession.CLOSED:
                     logging.info("Market closed, waiting...")
                     time.sleep(300)
                     continue
-                
-                # Stop trading if max loss reached
-                if daily_pnl < -self.risk_rules['max_loss_day']:
-                    logging.warning(f"Max daily loss of ${self.risk_rules['max_loss_day']} reached. Stopping for the day.")
-                    time.sleep(300)
-                    continue
-                
+                    
                 # Avoid midday chop
                 if session == MarketSession.MIDDAY:
-                    logging.info("Midday session - reduced trading")
+                    logging.info("Midday session - reduced scanning")
                     time.sleep(self._get_scraping_interval(session))
                     continue
                 
@@ -419,13 +481,12 @@ class TradingSystem:
                 time.sleep(self._get_scraping_interval(session))
                 
             except KeyboardInterrupt:
-                logging.info("Shutting down trading system...")
+                logging.info("Shutting down scanner...")
                 break
             except Exception as e:
                 logging.error(f"System error: {str(e)}")
                 time.sleep(60)
 
 if __name__ == "__main__":
-    # Initialize system with $10,000 starting capital 
-    system = TradingSystem(10000)
+    system = TradingSystem()
     system.run()
