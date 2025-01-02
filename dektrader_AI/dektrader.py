@@ -334,6 +334,23 @@ class TradingSystem:
         else:
             return MarketSession.CLOSED
 
+    def update_watchlist(self, session: MarketSession):
+        """Update watchlist with validation"""
+        try:
+            now = datetime.now()
+            interval = self._get_scraping_interval(session)
+            
+            if (now - self.last_scrape_time).total_seconds() >= interval:
+                new_symbols = self._scrape_stock_symbols()
+                
+                if new_symbols:
+                    self.stocks = new_symbols
+                    self.last_scrape_time = now
+                    logging.info(f"Updated watchlist: {len(self.stocks)} symbols")
+                    
+        except Exception as e:
+            logging.error(f"Error updating watchlist: {str(e)}")
+
     def _should_alert(self, symbol: str, current_price: float, current_volume: int, 
                      timestamp: datetime) -> bool:
         """Determine if we should send alert"""
