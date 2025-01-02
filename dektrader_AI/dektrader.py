@@ -311,6 +311,40 @@ class TradingSystem:
         
         logging.info(f"Trading Scanner initialized with {LLM_CONFIG['model']}")
 
+    def _calculate_trading_costs(self, price: float, shares: int) -> TradingCosts:
+        """Calculate trading costs with standard fees"""
+        principal = price * shares
+        sec_fee = (principal / 1_000_000) * 8.00  # SEC fee
+        finra_fee = (principal / 1_000) * 0.02    # FINRA fee
+        total_cost = sec_fee + finra_fee
+        
+        return TradingCosts(
+            sec_fee=sec_fee,
+            finra_fee=finra_fee,
+            total_cost=total_cost
+        )
+
+    def _calculate_position_size(self, price: float, stop_loss: float) -> int:
+        """Calculate theoretical position size for max $100 risk"""
+        risk_per_share = price - stop_loss
+        if risk_per_share <= 0:
+            return 0
+            
+        position = int(RISK_CONFIG['max_loss_per_trade'] / risk_per_share)
+        max_shares = int(10000 / price)  # Using $10k theoretical capital
+        return min(position, max_shares)
+
+    def _categorize_float(self, shares_float: float) -> str:
+        """Categorize float size"""
+        if shares_float < 5_000_000:
+            return "🔥 VERY LOW FLOAT (<5M)"
+        elif shares_float < 15_000_000:
+            return "⭐ LOW FLOAT (5M-15M)"
+        elif shares_float < 30_000_000:
+            return "📊 AVERAGE FLOAT (15M-30M)"
+        else:
+            return "🔷 HIGH FLOAT (>30M)"
+
     def get_market_session(self) -> MarketSession:
         """Determine current market session"""
         et_tz = pytz.timezone('US/Eastern')
@@ -334,41 +368,6 @@ class TradingSystem:
         else:
             return MarketSession.CLOSED
 
-    def update_watchlist(self, session: MarketSession):
-        """Update watchlist with validation"""
-        try:
-            now = datetime.now()
-            interval = self._get_scraping_interval(session)
-            
-            if (now - self.last_scrape_time).total_seconds() >= interval:
-                new_symbols = self._scrape_stock_symbols()
-                
-                if new_symbols:
-                    self.stocks = new_symbols
-                    self.last_scrape_time = now
-                    logging.info(f"Updated watchlist: {len(self.stocks)} symbols")
-                    
-        except Exception as e:
-            logging.error(f"Error updating watchlist: {str(e)}")
-
-    def _chunk_symbols(self, symbols: Set[str], size: int = 10):
-        """Split symbols into chunks for processing"""
-        it = iter(symbols)
-        return iter(lambda: tuple(islice(it, size)), ())
-
-    def _calculate_position_size(self, price: float, stop_loss: float) -> int:
-        """Calculate theoretical position size for max $100 risk"""
-        risk_per_share = price - stop_loss
-        if risk_per_share <= 0:
-            return 0
-            
-        # Target $100 risk per trade    
-        position = int(RISK_CONFIG['max_loss_per_trade'] / risk_per_share)
-        
-        # Limit position to keep max loss around $100
-        max_shares = int(10000 / price)  # Using $10k theoretical capital
-        return min(position, max_shares)
-
     def _should_alert(self, symbol: str, current_price: float, current_volume: int, 
                      timestamp: datetime) -> bool:
         """Determine if we should send alert"""
@@ -377,12 +376,10 @@ class TradingSystem:
             
         history = self.alert_history[symbol]
         
-        # Check if it's a new day
         current_date = timestamp.date()
         if current_date != history.last_alert_date.date():
             history.daily_alerts = 0
             
-        # Check alert limits
         if history.daily_alerts >= ALERT_CONFIG['max_daily_alerts']:
             logging.info(f"Skipping {symbol} - max daily alerts reached")
             return False
@@ -421,6 +418,8 @@ class TradingSystem:
                 daily_alerts=1,
                 last_alert_date=timestamp
             )
+        
+        logging.info(f"Recorded alert for {symbol} - Price: ${price:.2f}, Volume: {volume:,}")
 
     def send_discord_alert(self, plan: TradingPlan, session: MarketSession):
         """Send Discord alert"""
@@ -506,14 +505,92 @@ class TradingSystem:
             
         return set()
 
-    def _should_use_llm(self, volume_ratio: float, shares_float: float, 
-                       session: MarketSession) -> bool:
-        """Determine if setup warrants LLM analysis"""
-        return (
-            session in [MarketSession.MARKET_OPEN, MarketSession.PRE_MARKET] and
-            volume_ratio >= LLM_FILTERS['min_volume_ratio'] and
-            shares_float <= LLM_FILTERS['max_float']
-        )
+    def _chunk_symbols(self, symbols: Set[str], size: int = 10):
+        """Split symbols into chunks for processing"""
+        it = iter(symbols)
+        return iter(lambda: tuple(islice(it, size)), ())
+
+    def update_watchlist(self, session: MarketSession):
+        """Update watchlist with validation"""
+        try:
+            now = datetime.now()
+            interval = self._get_scraping_interval(session)
+            
+            if (now - self.last_scrape_time).total_seconds() >= interval:
+                new_symbols = self._scrape_stock_symbols()
+                
+                if new_symbols:
+                    self.stocks = new_symbols
+                    self.last_scrape_time = now
+                    logging.info(f"Updated watchlist: {len(self.stocks)} symbols")
+                    
+        except Exception as e:
+            logging.error(f"Error updating watchlist: {str(e)}")
+
+    def _monitor_positions(self, session: MarketSession):
+        """Check active positions for exits"""
+        now = datetime.now()
+        
+        for position in self.position_manager.get_active_positions():
+            if not self.position_manager.should_check_position(position.symbol):
+                continue
+                
+            try:
+                stock = yf.Ticker(position.symbol)
+                current_data = stock.history(period='1d')
+                if current_data.empty:
+                    continue
+                    
+                current_price = current_data['Close'].iloc[-1]
+                current_volume = current_data['Volume'].iloc[-1]
+                
+                # Get LLM advice
+                advice = self.llm.monitor_position(position, current_price, current_volume)
+                position.last_llm_advice = advice
+                
+                # Handle recommendations
+                if advice['urgency'] == 'HIGH':
+                    message = (
+                        f"🚨 URGENT POSITION UPDATE: {position.symbol}\n"
+                        f"Action: {advice['action']}\n"
+                        f"Reason: {advice['reason']}\n"
+                        f"Current Price: ${current_price:.2f}\n"
+                        f"Entry Price: ${position.entry_price:.2f}\n"
+                        f"P&L: {((current_price/position.entry_price - 1) * 100):.1f}%"
+                    )
+                    
+                    webhook = DiscordWebhook(
+                        url=self.webhook_url,
+                        content=message
+                    )
+                    webhook.execute()
+                
+                self.position_manager.update_position_check(position.symbol)
+                logging.info(f"Monitored {position.symbol}: {advice['action']} ({advice['reason']})")
+                
+            except Exception as e:
+                logging.error(f"Error monitoring {position.symbol}: {str(e)}")
+
+    def _is_valid_stock(self, symbol: str) -> bool:
+        """Validate stock against filters"""
+        try:
+            stock = yf.Ticker(symbol)
+            hist = stock.history(period='1d')
+            
+            if hist.empty:
+                return False
+                
+            price = hist['Close'].iloc[-1]
+            volume = hist['Volume'].sum()
+            
+            return (
+                TRADING_FILTERS['min_price'] <= price <= TRADING_FILTERS['max_price'] and
+                volume >= TRADING_FILTERS['min_volume'] and
+                symbol not in self.blacklist
+            )
+            
+        except Exception:
+            return False
 
     def analyze_stock(self, symbol: str, session: MarketSession) -> Optional[TradingPlan]:
         """Analyze stock with enhanced LLM criteria"""
@@ -522,6 +599,9 @@ class TradingSystem:
             return None
             
         try:
+            if not self._is_valid_stock(symbol):
+                return None
+                
             stock = yf.Ticker(symbol)
             hist = stock.history(period='1d', interval='1m')
             
@@ -595,50 +675,6 @@ class TradingSystem:
         except Exception as e:
             logging.error(f"Error analyzing {symbol}: {str(e)}")
             return None
-
-    def _monitor_positions(self, session: MarketSession):
-        """Check active positions for exits"""
-        now = datetime.now()
-        
-        for position in self.position_manager.get_active_positions():
-            if not self.position_manager.should_check_position(position.symbol):
-                continue
-                
-            try:
-                stock = yf.Ticker(position.symbol)
-                current_data = stock.history(period='1d')
-                if current_data.empty:
-                    continue
-                    
-                current_price = current_data['Close'].iloc[-1]
-                current_volume = current_data['Volume'].iloc[-1]
-                
-                # Get LLM advice
-                advice = self.llm.monitor_position(position, current_price, current_volume)
-                position.last_llm_advice = advice
-                
-                # Handle recommendations
-                if advice['urgency'] == 'HIGH':
-                    message = (
-                        f"🚨 URGENT POSITION UPDATE: {position.symbol}\n"
-                        f"Action: {advice['action']}\n"
-                        f"Reason: {advice['reason']}\n"
-                        f"Current Price: ${current_price:.2f}\n"
-                        f"Entry Price: ${position.entry_price:.2f}\n"
-                        f"P&L: {((current_price/position.entry_price - 1) * 100):.1f}%"
-                    )
-                    
-                    webhook = DiscordWebhook(
-                        url=self.webhook_url,
-                        content=message
-                    )
-                    webhook.execute()
-                
-                self.position_manager.update_position_check(position.symbol)
-                logging.info(f"Monitored {position.symbol}: {advice['action']} ({advice['reason']})")
-                
-            except Exception as e:
-                logging.error(f"Error monitoring {position.symbol}: {str(e)}")
 
     def run(self):
         """Main system loop with position monitoring"""
