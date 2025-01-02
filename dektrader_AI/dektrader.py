@@ -351,6 +351,11 @@ class TradingSystem:
         except Exception as e:
             logging.error(f"Error updating watchlist: {str(e)}")
 
+    def _chunk_symbols(self, symbols: Set[str], size: int = 10):
+        """Split symbols into chunks for processing"""
+        it = iter(symbols)
+        return iter(lambda: tuple(islice(it, size)), ())
+
     def _should_alert(self, symbol: str, current_price: float, current_volume: int, 
                      timestamp: datetime) -> bool:
         """Determine if we should send alert"""
