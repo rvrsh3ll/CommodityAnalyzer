@@ -356,6 +356,19 @@ class TradingSystem:
         it = iter(symbols)
         return iter(lambda: tuple(islice(it, size)), ())
 
+    def _calculate_position_size(self, price: float, stop_loss: float) -> int:
+        """Calculate theoretical position size for max $100 risk"""
+        risk_per_share = price - stop_loss
+        if risk_per_share <= 0:
+            return 0
+            
+        # Target $100 risk per trade    
+        position = int(RISK_CONFIG['max_loss_per_trade'] / risk_per_share)
+        
+        # Limit position to keep max loss around $100
+        max_shares = int(10000 / price)  # Using $10k theoretical capital
+        return min(position, max_shares)
+
     def _should_alert(self, symbol: str, current_price: float, current_volume: int, 
                      timestamp: datetime) -> bool:
         """Determine if we should send alert"""
