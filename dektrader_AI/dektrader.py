@@ -311,6 +311,29 @@ class TradingSystem:
         
         logging.info(f"Trading Scanner initialized with {LLM_CONFIG['model']}")
 
+    def get_market_session(self) -> MarketSession:
+        """Determine current market session"""
+        et_tz = pytz.timezone('US/Eastern')
+        now = datetime.now(et_tz)
+        
+        if now.weekday() >= 5:
+            return MarketSession.CLOSED
+            
+        current_time = now.strftime('%H:%M')
+        
+        if TRADING_SESSIONS['pre_market_start'] <= current_time < TRADING_SESSIONS['market_open']:
+            return MarketSession.PRE_MARKET
+        elif TRADING_SESSIONS['market_open'] <= current_time < TRADING_SESSIONS['midday_start']:
+            return MarketSession.MARKET_OPEN
+        elif TRADING_SESSIONS['midday_start'] <= current_time < '15:00':
+            return MarketSession.MIDDAY
+        elif '15:00' <= current_time < TRADING_SESSIONS['market_close']:
+            return MarketSession.MARKET_CLOSE
+        elif TRADING_SESSIONS['market_close'] <= current_time < TRADING_SESSIONS['after_hours_end']:
+            return MarketSession.AFTER_HOURS
+        else:
+            return MarketSession.CLOSED
+
     def _should_alert(self, symbol: str, current_price: float, current_volume: int, 
                      timestamp: datetime) -> bool:
         """Determine if we should send alert"""
