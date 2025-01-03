@@ -6,12 +6,41 @@ import ollama
 import asyncio
 import logging
 from datetime import datetime, timedelta
+import pytz
+import colorama
+from tabulate import tabulate
+
+# Initialize colorama for colored output
+colorama.init(autoreset=True)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('stock_scanner.log'),
+        logging.StreamHandler()
+    ]
 )
+
+def is_market_open():
+    """
+    Check if current time is during US stock market trading hours.
+    Market hours are 9:30 AM to 4:00 PM Eastern Time, Monday through Friday.
+    """
+    # Set timezone to Eastern Time
+    eastern = pytz.timezone('US/Eastern')
+    now = datetime.now(eastern)
+
+    # Check if it's a weekday (Monday = 0, Friday = 4)
+    is_weekday = now.weekday() < 5
+
+    # Check if time is between 9:30 AM and 4:00 PM
+    market_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    is_market_hours = market_open_time <= now < market_close_time
+
+    return is_weekday and is_market_hours
 
 class StockScanner:
     def __init__(self):
@@ -171,6 +200,7 @@ Target: $PRICE
 Stop: $PRICE
 Size: # shares
 Reason: [2-3 sentence explanation]
+Confidence: [0-100%]
 
 If no clear setup exists, respond with 'NO SETUP'."""
 
@@ -189,35 +219,109 @@ If no clear setup exists, respond with 'NO SETUP'."""
             logging.error(f"LLM analysis failed: {str(e)}")
             return "NO SETUP"
 
+class OutputFormatter:
+    @staticmethod
+    def format_trading_setup(setup):
+        """Nicely format the trading setup"""
+        try:
+            lines = setup.split("\n")
+            
+            # Prepare a table for better readability
+            table_data = [
+                ["Symbol", lines[0].split(": ")[1]],
+                ["Entry", lines[2].split(": ")[1]],
+                ["Target", lines[3].split(": ")[1]],
+                ["Stop Loss", lines[4].split(": ")[1]],
+                ["Position Size", lines[5].split(": ")[1]],
+                ["Confidence", lines[7].split(": ")[1]]
+            ]
+            
+            # Color-code based on confidence
+            confidence = int(lines[7].split(": ")[1].rstrip('%'))
+            if confidence > 80:
+                confidence_color = colorama.Fore.GREEN
+            elif confidence > 60:
+                confidence_color = colorama.Fore.YELLOW
+            else:
+                confidence_color = colorama.Fore.RED
+            
+            # Create formatted output
+            formatted_output = (
+                f"\n{colorama.Fore.CYAN}🔍 TRADING SETUP FOUND {colorama.Fore.RESET}\n"
+                f"{tabulate(table_data, headers=['Detail', 'Value'], tablefmt='fancy_grid')}\n\n"
+                f"🔬 {colorama.Fore.MAGENTA}Reason:{colorama.Fore.RESET} {lines[6]}\n"
+                f"📊 {colorama.Fore.CYAN}Confidence:{confidence_color} {lines[7]} {colorama.Fore.RESET}"
+            )
+            
+            return formatted_output
+        except Exception as e:
+            logging.error(f"Error formatting setup: {str(e)}")
+            return setup
+
 async def main():
     scanner = StockScanner()
     analyzer = StockAnalyzer()
     trader = TradingAnalyst()
+    formatter = OutputFormatter()
+
+    logging.info(f"{colorama.Fore.GREEN}Stock Scanner Initialized{colorama.Fore.RESET}")
 
     while True:
         try:
-            # Get symbols
-            symbols = scanner.get_symbols()
-            logging.info(f"Found {len(symbols)} symbols to analyze")
+            # Only scan during market hours
+            if is_market_open():
+                # Get symbols
+                symbols = scanner.get_symbols()
+                logging.info(f"{colorama.Fore.CYAN}Found {len(symbols)} symbols to analyze{colorama.Fore.RESET}")
 
-            # Analyze each symbol
-            for symbol in symbols:
-                # Get technical analysis data
-                data = analyzer.analyze_stock(symbol)
+                # Analyze each symbol asynchronously
+                tasks = []
+                for symbol in symbols:
+                    task = asyncio.create_task(analyze_symbol(symbol, analyzer, trader, formatter))
+                    tasks.append(task)
 
-                if data:
-                    # Get trading setup from LLM
-                    setup = await trader.analyze_setup(data)
-
-                    if setup and "NO SETUP" not in setup:
-                        print(f"\n{setup}")
+                await asyncio.gather(*tasks)
+            else:
+                # Market closed message with current time
+                eastern = pytz.timezone('US/Eastern')
+                current_time = datetime.now(eastern)
+                logging.info(
+                    f"{colorama.Fore.YELLOW}Market is closed. "
+                    f"Current time: {current_time.strftime('%I:%M %p %Z on %A')}"
+                    f"{colorama.Fore.RESET}"
+                )
 
             # Wait before next scan
             await asyncio.sleep(60)  # 1 minute delay
 
         except Exception as e:
-            logging.error(f"Main loop error: {str(e)}")
+            logging.error(f"{colorama.Fore.RED}Main loop error: {str(e)}{colorama.Fore.RESET}")
             await asyncio.sleep(60)
 
+async def analyze_symbol(symbol, analyzer, trader, formatter):
+    # Get technical analysis data
+    data = analyzer.analyze_stock(symbol)
+
+    if data:
+        # Get trading setup from LLM
+        setup = await trader.analyze_setup(data)
+
+        if setup and "NO SETUP" not in setup:
+            try:
+                confidence = float(setup.split("Confidence: ")[1].split("%")[0])
+                if confidence > 70:
+                    # Format and print setup
+                    formatted_setup = formatter.format_trading_setup(setup)
+                    print(formatted_setup)
+            except Exception as e:
+                logging.error(f"Error processing setup for {symbol}: {str(e)}")
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Add dependencies notice
+    print(f"{colorama.Fore.YELLOW}Note: Requires 'colorama', 'tabulate', 'pytz' libraries.{colorama.Fore.RESET}")
+    print(f"{colorama.Fore.YELLOW}Install with: pip install colorama tabulate pytz{colorama.Fore.RESET}")
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(f"\n{colorama.Fore.RED}Stock scanner stopped by user.{colorama.Fore.RESET}")
